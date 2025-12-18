@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"fmt"
 
 	"github.com/gorilla/websocket"
 	"tunnelx/protocol"
@@ -110,12 +111,13 @@ func wsWriter(t *Tunnel) {
 
 func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Println("➡️  HTTP IN")
-log.Println("Method:", r.Method)
-log.Println("URL:", r.URL.Path)
-log.Println("Headers:")
-for k, v := range r.Header {
-	log.Println(" ", k, ":", v)
-}
+	log.Println("Method:", r.Method)
+	log.Println("URL:", r.URL.Path)
+	log.Println("Headers:")
+	for k, v := range r.Header {
+		log.Println(" ", k, ":", v)
+	}
+
 	path := strings.TrimPrefix(r.URL.Path, "/share/")
 	parts := strings.SplitN(path, "/", 2)
 
@@ -135,8 +137,7 @@ for k, v := range r.Header {
 	mu.RUnlock()
 
 	log.Println("🎯 Tunnel found:", tunnelID)
-log.Println("➡️ Forward path:", forwardPath)
-
+	log.Println("➡️ Forward path:", forwardPath)
 
 	if tunnel == nil {
 		http.NotFound(w, r)
@@ -162,12 +163,22 @@ log.Println("➡️ Forward path:", forwardPath)
 	select {
 	case resp := <-respCh:
 		log.Println("⬅️ Response from CLI")
-        log.Println("Status:", resp.Status)
-        log.Println("Headers:")
-        for k, v := range resp.Headers {
-        	log.Println(" ", k, ":", v)
-        }
-        log.Println("Body size:", len(resp.Body))
+		log.Println("Status:", resp.Status)
+		log.Println("Headers:")
+		for k, v := range resp.Headers {
+			log.Println(" ", k, ":", v)
+		}
+		log.Println("Body size:", len(resp.Body))
+
+		// ===================== HTML REWRITE =====================
+		contentType := resp.Headers.Get("Content-Type")
+		if strings.Contains(contentType, "text/html") {
+			bodyStr := string(resp.Body)
+			bodyStr = rewriteURLs(bodyStr, tunnelID)
+			resp.Body = []byte(bodyStr)
+			resp.Headers.Set("Content-Length", fmt.Sprintf("%d", len(resp.Body)))
+		}
+		// ==========================================================
 
 		copyHeaders(w, resp.Headers)
 		w.WriteHeader(resp.Status)
@@ -176,6 +187,15 @@ log.Println("➡️ Forward path:", forwardPath)
 	case <-time.After(30 * time.Second):
 		http.Error(w, "Gateway Timeout", 504)
 	}
+}
+
+// ===================== HTML URL REWRITE =====================
+func rewriteURLs(html, tunnelID string) string {
+	basePath := "/share/" + tunnelID + "/"
+	// Replace relative href/src attributes
+	html = strings.ReplaceAll(html, `href="`, `href="`+basePath)
+	html = strings.ReplaceAll(html, `src="`, `src="`+basePath)
+	return html
 }
 
 // ===================== HEADER FIX =====================
