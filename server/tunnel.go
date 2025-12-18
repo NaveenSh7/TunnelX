@@ -1,13 +1,12 @@
 package main
 
 import (
-	//"encoding/json"
-	//"errors"
 	"io"
 	"log"
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"tunnelx/protocol"
@@ -18,9 +17,19 @@ var upgrader = websocket.Upgrader{
 }
 
 var (
-	tunnels = make(map[string]*protocol.Tunnel)
+	tunnels = make(map[string]*Tunnel)
 	mu      sync.RWMutex
 )
+
+type Tunnel struct {
+	ID      string
+	Conn    *websocket.Conn
+	Send    chan interface{}
+	Pending map[string]chan protocol.TunnelResponse
+	Mutex   sync.Mutex
+}
+
+// ===================== WEBSOCKET =====================
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -34,107 +43,194 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if reg.Type != "register" || reg.TunnelID == "" {
-		conn.Close()
-		return
-	}
-
 	base := getPublicURL()
-	if base == "" {
+	if reg.Type != "register" || reg.TunnelID == "" || base == "" {
 		conn.Close()
 		return
 	}
 
-	tunnel := &protocol.Tunnel{
-		ID:        reg.TunnelID,
-		Conn:      conn,
-		Send:      make(chan interface{}, 8),
-		PublicURL: base + "/share/" + reg.TunnelID,
+	tunnel := &Tunnel{
+		ID:      reg.TunnelID,
+		Conn:    conn,
+		Send:    make(chan interface{}, 32),
+		Pending: make(map[string]chan protocol.TunnelResponse),
 	}
 
 	mu.Lock()
 	tunnels[reg.TunnelID] = tunnel
 	mu.Unlock()
 
-	// 🔑 single writer goroutine
-	go func() {
-		for msg := range tunnel.Send {
-			if err := conn.WriteJSON(msg); err != nil {
-				return
-			}
-		}
-	}()
+	go wsWriter(tunnel)
+	go wsReader(tunnel)
 
-	// Send URL to CLI
 	tunnel.Send <- protocol.RegisterResponse{
 		Type:      "registered",
-		PublicURL: tunnel.PublicURL,
+		PublicURL: base + "/share/" + reg.TunnelID,
 	}
 
-	log.Println("Tunnel registered:", reg.TunnelID)
+	log.Println("✅ Tunnel registered:", reg.TunnelID)
+}
 
-	// single reader loop
+func wsReader(t *Tunnel) {
+	defer cleanupTunnel(t)
+
 	for {
 		var resp protocol.TunnelResponse
-		if err := conn.ReadJSON(&resp); err != nil {
-			mu.Lock()
-			delete(tunnels, reg.TunnelID)
-			mu.Unlock()
+		if err := t.Conn.ReadJSON(&resp); err != nil {
+			return
+		}
+		log.Println("📥 WS RESPONSE")
+log.Println("ID:", resp.ID)
+log.Println("Status:", resp.Status)
+log.Println("Headers:", resp.Headers)
+log.Println("Body size:", len(resp.Body))
+
+		t.Mutex.Lock()
+		ch := t.Pending[resp.ID]
+		delete(t.Pending, resp.ID)
+		t.Mutex.Unlock()
+
+		if ch != nil {
+			ch <- resp
+		}
+	}
+}
+
+func wsWriter(t *Tunnel) {
+
+	for msg := range t.Send {
+
+		if err := t.Conn.WriteJSON(msg); err != nil {
 			return
 		}
 	}
 }
 
-func handleHTTP(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+// ===================== HTTP PROXY =====================
 
-	if len(parts) < 2 || parts[0] != "share" {
-		http.Error(w, "Invalid TunnelX URL", 400)
+func handleHTTP(w http.ResponseWriter, r *http.Request) {
+	log.Println("➡️  HTTP IN")
+log.Println("Method:", r.Method)
+log.Println("URL:", r.URL.Path)
+log.Println("Headers:")
+for k, v := range r.Header {
+	log.Println(" ", k, ":", v)
+}
+	path := strings.TrimPrefix(r.URL.Path, "/share/")
+	parts := strings.SplitN(path, "/", 2)
+
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
 		return
 	}
 
-	tunnelID := parts[1]
-	path := "/"
-	if len(parts) > 2 {
-		path += strings.Join(parts[2:], "/")
+	tunnelID := parts[0]
+	forwardPath := "/"
+	if len(parts) == 2 {
+		forwardPath += parts[1]
 	}
 
 	mu.RLock()
 	tunnel := tunnels[tunnelID]
 	mu.RUnlock()
 
+	log.Println("🎯 Tunnel found:", tunnelID)
+log.Println("➡️ Forward path:", forwardPath)
+
+
 	if tunnel == nil {
-		http.Error(w, "Tunnel inactive", 503)
+		http.NotFound(w, r)
 		return
 	}
 
 	body, _ := io.ReadAll(r.Body)
+	reqID := generateID()
 
-	req := protocol.TunnelRequest{
+	respCh := make(chan protocol.TunnelResponse, 1)
+	tunnel.Mutex.Lock()
+	tunnel.Pending[reqID] = respCh
+	tunnel.Mutex.Unlock()
+
+	tunnel.Send <- protocol.TunnelRequest{
+		ID:      reqID,
 		Method:  r.Method,
-		Path:    path,
+		Path:    forwardPath,
 		Headers: r.Header,
 		Body:    body,
 	}
 
-	tunnel.Send <- req
+	select {
+	case resp := <-respCh:
+		log.Println("⬅️ Response from CLI")
+        log.Println("Status:", resp.Status)
+        log.Println("Headers:")
+        for k, v := range resp.Headers {
+        	log.Println(" ", k, ":", v)
+        }
+        log.Println("Body size:", len(resp.Body))
 
-	var resp protocol.TunnelResponse
-	if err := tunnel.Conn.ReadJSON(&resp); err != nil {
-		http.Error(w, "Tunnel read failed", 500)
-		return
+		copyHeaders(w, resp.Headers)
+		w.WriteHeader(resp.Status)
+		w.Write(resp.Body)
+
+	case <-time.After(30 * time.Second):
+		http.Error(w, "Gateway Timeout", 504)
+	}
+}
+
+// ===================== HEADER FIX =====================
+
+func copyHeaders(w http.ResponseWriter, h http.Header) {
+	// Remove default headers
+	for k := range w.Header() {
+		w.Header().Del(k)
 	}
 
-	for k, v := range resp.Headers {
+	for k, v := range h {
+		if isHopByHop(k) {
+			continue
+		}
 		for _, val := range v {
 			w.Header().Add(k, val)
 		}
 	}
-	w.WriteHeader(resp.Status)
-	w.Write(resp.Body)
 }
 
-// helper to grab Global url from cloudflared.go
+func isHopByHop(h string) bool {
+	switch strings.ToLower(h) {
+	case "connection",
+		"keep-alive",
+		"proxy-authenticate",
+		"proxy-authorization",
+		"te",
+		"trailer",
+		"transfer-encoding",
+		"upgrade",
+		"content-length":
+		return true
+	default:
+		return false
+	}
+}
+
+// ===================== CLEANUP =====================
+
+func cleanupTunnel(t *Tunnel) {
+	mu.Lock()
+	delete(tunnels, t.ID)
+	mu.Unlock()
+
+	close(t.Send)
+	t.Conn.Close()
+	log.Println("❌ Tunnel closed:", t.ID)
+}
+
+// ===================== UTIL =====================
+
+func generateID() string {
+	return time.Now().Format("20060102150405.000000000")
+}
+
 func getPublicURL() string {
 	val := publicURL.Load()
 	if val == nil {

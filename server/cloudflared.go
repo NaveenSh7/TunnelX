@@ -19,7 +19,7 @@ func startCloudflaredLoop() {
 			log.Println("🚀 Starting cloudflared...")
 
 			cmd := exec.Command(
-				"cloudflared",
+				"Cloudflared",
 				"tunnel",
 				"--url",
 				"http://localhost:8080",

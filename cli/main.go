@@ -69,10 +69,12 @@ func handleRequest(conn *websocket.Conn, treq protocol.TunnelRequest, port strin
 	body, _ := io.ReadAll(resp.Body)
 
 	conn.WriteJSON(protocol.TunnelResponse{
-		Status:  resp.StatusCode,
-		Headers: resp.Header,
-		Body:    body,
-	})
+	ID:      treq.ID,
+	Status:  resp.StatusCode,
+	Headers: resp.Header,
+	Body:    body,
+    })
+
 }
 
 func sendError(conn *websocket.Conn) {

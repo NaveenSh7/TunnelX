@@ -2,6 +2,8 @@ package protocol
 
 import (
 	"github.com/gorilla/websocket"
+	"net/http"
+	"sync"
 )
 
 // Sent by CLI when connecting
@@ -12,16 +14,18 @@ type RegisterMessage struct {
 
 // Sent by Server to CLI
 type TunnelRequest struct {
+	ID      string              `json:"id"`
 	Method  string              `json:"method"`
 	Path    string              `json:"path"`
-	Headers map[string][]string `json:"headers"`
+	Headers http.Header         `json:"headers"`
 	Body    []byte              `json:"body"`
 }
 
 // Sent by CLI to Server
 type TunnelResponse struct {
+	ID      string              `json:"id"`
 	Status  int                 `json:"status"`
-	Headers map[string][]string `json:"headers"`
+	Headers http.Header         `json:"headers"`
 	Body    []byte              `json:"body"`
 }
 
@@ -33,6 +37,9 @@ type RegisterResponse struct {
 type Tunnel struct {
 	ID        string
 	Conn      *websocket.Conn
-	Send      chan interface{} // single writer channel
+	Send      chan interface{}
+	Pending   map[string]chan TunnelResponse
+	Mutex     sync.Mutex
 	PublicURL string
 }
+
