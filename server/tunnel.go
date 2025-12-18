@@ -10,6 +10,8 @@ import (
 	"sync"
 
 	"github.com/gorilla/websocket"
+
+	"tunnelx/protocol"
 )
 
 var upgrader = websocket.Upgrader{
@@ -21,24 +23,6 @@ var tunnels = make(map[string]*websocket.Conn)
 var mu sync.Mutex
 
 // -------- WebSocket (CLI) --------
-
-type RegisterMessage struct {
-	Type     string `json:"type"`
-	TunnelID string `json:"tunnelId"`
-}
-
-type TunnelRequest struct {
-	Method  string              `json:"method"`
-	Path    string              `json:"path"`
-	Headers map[string][]string `json:"headers"`
-	Body    []byte              `json:"body"`
-}
-
-type TunnelResponse struct {
-	Status  int                 `json:"status"`
-	Headers map[string][]string `json:"headers"`
-	Body    []byte              `json:"body"`
-}
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -54,7 +38,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var reg RegisterMessage
+	var reg protocol.RegisterMessage
+
 	if err := json.Unmarshal(msg, &reg); err != nil {
 		log.Println("Invalid register message")
 		return
@@ -118,7 +103,7 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// Read request body
 	body, _ := io.ReadAll(r.Body)
 
-	req := TunnelRequest{
+	req := protocol.TunnelRequest{
 		Method:  r.Method,
 		Path:    forwardPath,
 		Headers: r.Header,
@@ -141,7 +126,8 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var resp TunnelResponse
+	var resp protocol.TunnelResponse
+
 	if err := json.Unmarshal(msg, &resp); err != nil {
 		http.Error(w, "Invalid tunnel response", 500)
 		return
