@@ -1,5 +1,8 @@
 package protocol
 
+import (
+	"github.com/gorilla/websocket"
+)
 // Sent by CLI when connecting
 type RegisterMessage struct {
 	Type     string `json:"type"`
@@ -19,4 +22,15 @@ type TunnelResponse struct {
 	Status  int                 `json:"status"`
 	Headers map[string][]string `json:"headers"`
 	Body    []byte              `json:"body"`
+}
+
+type RegisterResponse struct {
+	Type      string `json:"type"`
+	PublicURL string `json:"publicUrl"`
+}
+
+type Tunnel struct {
+	ID        string
+	Conn      *websocket.Conn
+	PublicURL string
 }

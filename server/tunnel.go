@@ -1,11 +1,9 @@
 package main
 
 import (
-	"encoding/json"
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 
@@ -18,9 +16,11 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-// tunnelID → websocket connection
-var tunnels = make(map[string]*websocket.Conn)
-var mu sync.Mutex
+
+var (
+	tunnels = make(map[string]*protocol.Tunnel)
+	mu      sync.RWMutex
+)
 
 // -------- WebSocket (CLI) --------
 
@@ -31,33 +31,46 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read registration message
-	_, msg, err := conn.ReadMessage()
-	if err != nil {
-		log.Println("WS read error:", err)
-		return
-	}
-
 	var reg protocol.RegisterMessage
-
-	if err := json.Unmarshal(msg, &reg); err != nil {
-		log.Println("Invalid register message")
+	if err := conn.ReadJSON(&reg); err != nil {
+		log.Println("Register read error:", err)
+		conn.Close()
 		return
 	}
 
 	if reg.Type != "register" || reg.TunnelID == "" {
-		log.Println("Invalid registration data")
+		conn.Close()
 		return
 	}
 
-	// naya tunnel connection register karna
+	// 1️⃣ Create Cloudflare public URL
+	publicURL, err := createCloudflareURL(reg.TunnelID)
+	if err != nil {
+		conn.Close()
+		return
+	}
+
+	// 2️⃣ Save tunnel mapping
+	tunnel := &protocol.Tunnel{
+		ID:        reg.TunnelID,
+		Conn:      conn,
+		PublicURL: publicURL,
+	}
+
 	mu.Lock()
-	tunnels[reg.TunnelID] = conn
+	tunnels[reg.TunnelID] = tunnel
 	mu.Unlock()
 
 	log.Println("Tunnel registered:", reg.TunnelID)
 
-	// Keep connection alive
+	// 3️⃣ Send URL to CLI
+	resp := protocol.RegisterResponse{
+		Type:      "registered",
+		PublicURL: publicURL,
+	}
+	conn.WriteJSON(resp)
+
+	// 4️⃣ Keep WS alive
 	for {
 		if _, _, err := conn.ReadMessage(); err != nil {
 			log.Println("Tunnel disconnected:", reg.TunnelID)
@@ -69,38 +82,32 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// -------- HTTP (Public) --------
 
 func handleHTTP(w http.ResponseWriter, r *http.Request) {
-	// Expect: /t/{tunnelId}/path
-	// random banda jab url per hit karega tabh
-	fullURL := getFullURL(r)
+	// URL: https://xyz.trycloudflare.com/t/{tunnelID}/path
+	path := strings.Trim(r.URL.Path, "/")
+	parts := strings.Split(path, "/")
 
-	u, err := url.Parse(fullURL)
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	log.Println("parts", parts)
 	if len(parts) < 2 || parts[0] != "t" {
-		http.Error(w, "Invalid TunnelX URL", http.StatusBadRequest)
+		http.Error(w, "Invalid tunnel URL", 400)
 		return
 	}
 
 	tunnelID := parts[1]
 	forwardPath := "/"
-	if len(parts) == 4 {
-		forwardPath += parts[3]
+	if len(parts) > 2 {
+		forwardPath += strings.Join(parts[2:], "/")
 	}
 
-	mu.Lock()
-	conn := tunnels[tunnelID]
-	mu.Unlock()
+	mu.RLock()
+	tunnel := tunnels[tunnelID]
+	mu.RUnlock()
 
-	if conn == nil {
-		http.Error(w, "No active tunnel", http.StatusServiceUnavailable)
+	if tunnel == nil {
+		http.Error(w, "Tunnel not active", 503)
 		return
 	}
 
-	// reqs details ko CLI ko send karna vai WS
-	// Read request body
 	body, _ := io.ReadAll(r.Body)
 
 	req := protocol.TunnelRequest{
@@ -110,39 +117,35 @@ func handleHTTP(w http.ResponseWriter, r *http.Request) {
 		Body:    body,
 	}
 
-	payload, _ := json.Marshal(req)
-
-	err = conn.WriteMessage(websocket.TextMessage, payload)
-	if err != nil {
+	// 1️⃣ Forward request to CLI
+	if err := tunnel.Conn.WriteJSON(req); err != nil {
 		http.Error(w, "Tunnel write failed", 500)
 		return
 	}
 
-	// CLI ka resp analyze karke wapis user ko bhejna
-	// Read response from CLI
-	_, msg, err := conn.ReadMessage()
-	if err != nil {
+	// 2️⃣ Read response from CLI
+	var resp protocol.TunnelResponse
+	if err := tunnel.Conn.ReadJSON(&resp); err != nil {
 		http.Error(w, "Tunnel read failed", 500)
 		return
 	}
 
-	var resp protocol.TunnelResponse
-
-	if err := json.Unmarshal(msg, &resp); err != nil {
-		http.Error(w, "Invalid tunnel response", 500)
-		return
-	}
-
-	// Write headers
+	// 3️⃣ Send response to browser
 	for k, v := range resp.Headers {
 		for _, val := range v {
 			w.Header().Add(k, val)
 		}
 	}
-
 	w.WriteHeader(resp.Status)
 	w.Write(resp.Body)
+}
 
+
+
+func createCloudflareURL(tunnelID string) (string, error) {
+	// Example: call cloudflared API / local process
+	// For now mock:
+	return "https://abcd-" + tunnelID[:6] + ".trycloudflare.com", nil
 }
 
 // helper to parse url from bando ka req
@@ -157,3 +160,14 @@ func getFullURL(r *http.Request) string {
 	}
 	return scheme + "://" + r.Host + r.URL.RequestURI()
 }
+
+func getPublicURL(r *http.Request, tunnelID string) string {
+	scheme := "https"
+
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	}
+
+	return scheme + "://" + r.Host + "/t/" + tunnelID
+}
+

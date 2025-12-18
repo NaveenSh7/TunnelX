@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -11,27 +10,10 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"tunnelx/protocol"
 )
 
-const SERVER_WS = "wss://YOUR_AWS_SERVER/ws" // <-- change this
-
-type RegisterMessage struct {
-	Type     string `json:"type"`
-	TunnelID string `json:"tunnelId"`
-}
-
-type TunnelRequest struct {
-	Method  string              `json:"method"`
-	Path    string              `json:"path"`
-	Headers map[string][]string `json:"headers"`
-	Body    []byte              `json:"body"`
-}
-
-type TunnelResponse struct {
-	Status  int                 `json:"status"`
-	Headers map[string][]string `json:"headers"`
-	Body    []byte              `json:"body"`
-}
+const SERVER_WS = "ws://localhost:8080/ws" // change this
 
 func main() {
 	if len(os.Args) != 2 {
@@ -43,14 +25,15 @@ func main() {
 	tunnelID := generateTunnelID()
 
 	fmt.Println("🔗 Connecting to tunnel server...")
+
 	conn, _, err := websocket.DefaultDialer.Dial(SERVER_WS, nil)
 	if err != nil {
 		log.Fatal("WebSocket connect failed:", err)
 	}
 	defer conn.Close()
 
-	// Register tunnel
-	reg := RegisterMessage{
+	// ---------- REGISTER ----------
+	reg := protocol.RegisterMessage{
 		Type:     "register",
 		TunnelID: tunnelID,
 	}
@@ -59,14 +42,25 @@ func main() {
 		log.Fatal("Register failed:", err)
 	}
 
+	// ---------- READ PUBLIC URL ----------
+	var resp protocol.RegisterResponse
+	if err := conn.ReadJSON(&resp); err != nil {
+		log.Fatal("Failed to read register response:", err)
+	}
+
+	if resp.Type != "registered" {
+		log.Fatal("Invalid register response from server")
+	}
+
 	fmt.Println("✅ Tunnel connected")
 	fmt.Println("🌍 Public URL:")
-	fmt.Printf("   https://<cloudflare-domain>/t/%s\n\n", tunnelID)
+	fmt.Println("   " + resp.PublicURL)
 	fmt.Println("🚀 Forwarding to http://localhost:" + port)
+	fmt.Println()
 
-	// Listen for incoming requests
+	// ---------- TUNNEL LOOP ----------
 	for {
-		var req TunnelRequest
+		var req protocol.TunnelRequest
 		if err := conn.ReadJSON(&req); err != nil {
 			log.Fatal("Tunnel closed:", err)
 		}
@@ -75,7 +69,7 @@ func main() {
 	}
 }
 
-func handleRequest(conn *websocket.Conn, treq TunnelRequest, port string) {
+func handleRequest(conn *websocket.Conn, treq protocol.TunnelRequest, port string) {
 	url := "http://localhost:" + port + treq.Path
 
 	httpReq, err := http.NewRequest(treq.Method, url, bytes.NewReader(treq.Body))
@@ -96,7 +90,7 @@ func handleRequest(conn *websocket.Conn, treq TunnelRequest, port string) {
 
 	body, _ := io.ReadAll(resp.Body)
 
-	tresp := TunnelResponse{
+	tresp := protocol.TunnelResponse{
 		Status:  resp.StatusCode,
 		Headers: resp.Header,
 		Body:    body,
@@ -106,7 +100,7 @@ func handleRequest(conn *websocket.Conn, treq TunnelRequest, port string) {
 }
 
 func sendError(conn *websocket.Conn) {
-	conn.WriteJSON(TunnelResponse{
+	conn.WriteJSON(protocol.TunnelResponse{
 		Status:  502,
 		Headers: map[string][]string{"Content-Type": {"text/plain"}},
 		Body:    []byte("Bad Gateway"),
