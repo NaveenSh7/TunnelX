@@ -3,6 +3,7 @@ package protocol
 import (
 	"github.com/gorilla/websocket"
 )
+
 // Sent by CLI when connecting
 type RegisterMessage struct {
 	Type     string `json:"type"`
@@ -32,5 +33,6 @@ type RegisterResponse struct {
 type Tunnel struct {
 	ID        string
 	Conn      *websocket.Conn
+	Send      chan interface{} // single writer channel
 	PublicURL string
 }

@@ -6,6 +6,8 @@ import (
 )
 
 func main() {
+	startCloudflaredLoop()
+
 	http.HandleFunc("/ws", handleWebSocket) // CLI connects here
 	http.HandleFunc("/", handleHTTP)        // Public traffic
 

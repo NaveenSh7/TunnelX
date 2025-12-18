@@ -13,71 +13,49 @@ import (
 	"tunnelx/protocol"
 )
 
-const SERVER_WS = "ws://localhost:8080/ws" // change this
+const SERVER_WS = "ws://localhost:8080/ws"
 
 func main() {
 	if len(os.Args) != 2 {
-		fmt.Println("Usage: tunnel <port>")
+		fmt.Println("Usage: tunnelx <port>")
 		os.Exit(1)
 	}
 
 	port := os.Args[1]
-	tunnelID := generateTunnelID()
-
-	fmt.Println("🔗 Connecting to tunnel server...")
+	tunnelID := fmt.Sprintf("%d", time.Now().UnixNano())
 
 	conn, _, err := websocket.DefaultDialer.Dial(SERVER_WS, nil)
 	if err != nil {
-		log.Fatal("WebSocket connect failed:", err)
+		log.Fatal(err)
 	}
 	defer conn.Close()
 
-	// ---------- REGISTER ----------
-	reg := protocol.RegisterMessage{
+	conn.WriteJSON(protocol.RegisterMessage{
 		Type:     "register",
 		TunnelID: tunnelID,
+	})
+
+	var regResp protocol.RegisterResponse
+	if err := conn.ReadJSON(&regResp); err != nil {
+		log.Fatal(err)
 	}
 
-	if err := conn.WriteJSON(reg); err != nil {
-		log.Fatal("Register failed:", err)
-	}
+	fmt.Println("🌍 Public URL:", regResp.PublicURL)
 
-	// ---------- READ PUBLIC URL ----------
-	var resp protocol.RegisterResponse
-	if err := conn.ReadJSON(&resp); err != nil {
-		log.Fatal("Failed to read register response:", err)
-	}
-
-	if resp.Type != "registered" {
-		log.Fatal("Invalid register response from server")
-	}
-
-	fmt.Println("✅ Tunnel connected")
-	fmt.Println("🌍 Public URL:")
-	fmt.Println("   " + resp.PublicURL)
-	fmt.Println("🚀 Forwarding to http://localhost:" + port)
-	fmt.Println()
-
-	// ---------- TUNNEL LOOP ----------
 	for {
 		var req protocol.TunnelRequest
 		if err := conn.ReadJSON(&req); err != nil {
-			log.Fatal("Tunnel closed:", err)
+			log.Fatal(err)
 		}
 
-		go handleRequest(conn, req, port)
+		handleRequest(conn, req, port)
 	}
 }
 
 func handleRequest(conn *websocket.Conn, treq protocol.TunnelRequest, port string) {
 	url := "http://localhost:" + port + treq.Path
 
-	httpReq, err := http.NewRequest(treq.Method, url, bytes.NewReader(treq.Body))
-	if err != nil {
-		sendError(conn)
-		return
-	}
-
+	httpReq, _ := http.NewRequest(treq.Method, url, bytes.NewReader(treq.Body))
 	httpReq.Header = treq.Headers
 
 	client := &http.Client{Timeout: 30 * time.Second}
@@ -90,23 +68,19 @@ func handleRequest(conn *websocket.Conn, treq protocol.TunnelRequest, port strin
 
 	body, _ := io.ReadAll(resp.Body)
 
-	tresp := protocol.TunnelResponse{
+	conn.WriteJSON(protocol.TunnelResponse{
 		Status:  resp.StatusCode,
 		Headers: resp.Header,
 		Body:    body,
-	}
-
-	conn.WriteJSON(tresp)
+	})
 }
 
 func sendError(conn *websocket.Conn) {
 	conn.WriteJSON(protocol.TunnelResponse{
-		Status:  502,
-		Headers: map[string][]string{"Content-Type": {"text/plain"}},
-		Body:    []byte("Bad Gateway"),
+		Status: 502,
+		Headers: map[string][]string{
+			"Content-Type": {"text/plain"},
+		},
+		Body: []byte("Bad Gateway"),
 	})
-}
-
-func generateTunnelID() string {
-	return fmt.Sprintf("%d", time.Now().UnixNano())
 }
